@@ -1,0 +1,17 @@
+{
+  "name": "multiwall-projection-mapper",
+  "version": "1.0.0",
+  "description": "多面展墙投影映射工作台: 真实几何变换、线性光融合、校正网格导出与模拟相机验证",
+  "private": true,
+  "scripts": {
+    "selftest": "node cli/mpm-cli.js --selftest",
+    "render": "node cli/mpm-cli.js",
+    "serve": "node tools/serve.js",
+    "uitest": "node tools/uitest.js"
+  },
+  "keywords": ["projection-mapping", "edge-blend", "calibration", "multi-surface"],
+  "license": "MIT",
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

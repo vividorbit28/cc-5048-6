@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多面展墙投影映射工作台</title>
+<link rel="stylesheet" href="web/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">▰▰▰</span>
+    <div>
+      <h1>多面展墙投影映射工作台</h1>
+      <p>真实几何变换 · 线性光融合 · 可导出校正网格</p>
+    </div>
+  </div>
+  <div class="top-controls">
+    <label>场景
+      <select id="presetSelect">
+        <option value="folded">折角三墙 · 重叠融合(含位置偏差)</option>
+        <option value="lcorner">L 形墙角 · 墙角连续性</option>
+        <option value="flat">平面双机 · 接缝亮度</option>
+      </select>
+    </label>
+    <label>渲染质量
+      <select id="qualitySelect">
+        <option value="draft">草图(快)</option>
+        <option value="standard" selected>标准</option>
+        <option value="fine">精细(慢)</option>
+      </select>
+    </label>
+    <button id="resetBtn" class="btn">恢复预设位姿</button>
+    <button id="correctBtn" class="btn primary">一键校正偏差机</button>
+  </div>
+</header>
+
+<div id="errorBanner" class="error-banner hidden"></div>
+
+<main class="layout">
+  <!-- 左列: 俯视几何编辑 + 参数 -->
+  <section class="panel left-panel">
+    <div class="panel-head">
+      <h2>空间几何 · 俯视标定</h2>
+      <span class="hint">拖动角点 / 投影机 / 目标点调整几何</span>
+    </div>
+    <div class="editor-wrap">
+      <canvas id="editorCanvas" width="520" height="420"></canvas>
+      <div class="editor-legend">
+        <span><i class="dot wall"></i>墙面/角点</span>
+        <span><i class="dot pj"></i>投影机</span>
+        <span><i class="dot aim"></i>目标点</span>
+        <span><i class="dot cam"></i>模拟相机</span>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="wall">墙面</button>
+      <button class="tab" data-tab="projector">投影机</button>
+      <button class="tab" data-tab="blend">融合/编码</button>
+      <button class="tab" data-tab="camera">相机/内容</button>
+    </div>
+
+    <div class="tab-body" id="tab-wall">
+      <div class="form-row">
+        <label>墙高 (m)
+          <input type="number" id="wallHeight" min="0.5" max="10" step="0.1">
+        </label>
+      </div>
+      <div id="cornerList" class="corner-list"></div>
+      <p class="note">角点为相邻墙面共享点, 拖动一个角点会同时改变两面墙, 保证折线连续。</p>
+    </div>
+
+    <div class="tab-body hidden" id="tab-projector">
+      <label>选择投影机
+        <select id="pjSelect"></select>
+      </label>
+      <div class="form-grid">
+        <label>位置 X<input type="number" id="pjPosX" step="0.1"></label>
+        <label>位置 Y<input type="number" id="pjPosY" step="0.1"></label>
+        <label>位置 Z<input type="number" id="pjPosZ" step="0.1"></label>
+        <label>目标 X<input type="number" id="pjTgtX" step="0.1"></label>
+        <label>目标 Y<input type="number" id="pjTgtY" step="0.1"></label>
+        <label>目标 Z<input type="number" id="pjTgtZ" step="0.1"></label>
+        <label>垂直视场角°<input type="number" id="pjFov" min="10" max="120" step="1"></label>
+        <label>总增益<input type="number" id="pjGain" min="0.1" max="2" step="0.05"></label>
+      </div>
+      <div class="form-grid rgb-gain">
+        <label>R 增益<input type="number" id="pjR" min="0.1" max="2" step="0.05"></label>
+        <label>G 增益<input type="number" id="pjG" min="0.1" max="2" step="0.05"></label>
+        <label>B 增益<input type="number" id="pjB" min="0.1" max="2" step="0.05"></label>
+      </div>
+      <div class="clip-status" id="clipStatus"></div>
+    </div>
+
+    <div class="tab-body hidden" id="tab-blend">
+      <div class="form-grid">
+        <label>左羽化带<input type="number" id="fLeft" min="0" max="0.45" step="0.01"></label>
+        <label>右羽化带<input type="number" id="fRight" min="0" max="0.45" step="0.01"></label>
+        <label>下羽化带<input type="number" id="fBottom" min="0" max="0.45" step="0.01"></label>
+        <label>上羽化带<input type="number" id="fTop" min="0" max="0.45" step="0.01"></label>
+      </div>
+      <div class="form-row">
+        <label>融合曲线指数 (仅改变融合权重曲线, 不改变线性光处理空间)
+          <input type="range" id="blendGamma" min="0.5" max="2" step="0.05" value="1">
+          <span id="blendGammaVal">1.00</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>显示编码 gamma (线性光 ↔ 显示编码)
+          <input type="range" id="gammaRange" min="1.5" max="2.8" step="0.05" value="2.2">
+          <span id="gammaVal">2.20</span>
+        </label>
+      </div>
+      <p class="note">融合加权始终在线性光空间进行; gamma 只作用于最终显示编码。重叠带按 w/Σw 归一, 不会叠加过亮。</p>
+    </div>
+
+    <div class="tab-body hidden" id="tab-camera">
+      <label>测试图案
+        <select id="patternSelect">
+          <option value="grid-gradient" selected>格线 + 渐变</option>
+          <option value="grid">纯格线</option>
+          <option value="gradient">平滑渐变</option>
+          <option value="checker">棋盘格</option>
+        </select>
+      </label>
+      <div class="form-grid">
+        <label>相机 X<input type="number" id="camPosX" step="0.1"></label>
+        <label>相机 Y<input type="number" id="camPosY" step="0.1"></label>
+        <label>相机 Z<input type="number" id="camPosZ" step="0.1"></label>
+        <label>视点 X<input type="number" id="camTgtX" step="0.1"></label>
+        <label>视点 Y<input type="number" id="camTgtY" step="0.1"></label>
+        <label>视点 Z<input type="number" id="camTgtZ" step="0.1"></label>
+        <label>相机视场角°<input type="number" id="camFov" min="10" max="120" step="1"></label>
+      </div>
+      <button id="audioBtn" class="btn">开启空间音画视窗</button>
+      <p class="note">开启后在模拟相机画面移动指针: 声像随墙面水平位置移动, 音量随该位置重建亮度变化。</p>
+    </div>
+  </section>
+
+  <!-- 中列: 投影机输出 -->
+  <section class="panel center-panel">
+    <div class="panel-head">
+      <h2>各投影机输出图 (实际可投影像素)</h2>
+      <span class="hint">蓝灰=投影范围外/被遮挡</span>
+    </div>
+    <div id="pjOutputs" class="pj-grid"></div>
+    <div class="panel-head sub">
+      <h2>校正网格 (扭曲预览)</h2>
+      <div class="export-row">
+        <button id="exportMeshBtn" class="btn small">导出校正网格 JSON</button>
+        <button id="exportWarpBtn" class="btn small">导出扭曲网格 PNG</button>
+        <button id="exportPJBtn" class="btn small">导出投影输出 PNG</button>
+      </div>
+    </div>
+    <div id="warpGridWrap" class="warp-wrap"></div>
+  </section>
+
+  <!-- 右列: 模拟相机重建 + 接缝分析 -->
+  <section class="panel right-panel">
+    <div class="panel-head">
+      <h2>模拟相机重建 (合成效果)</h2>
+      <span class="hint">无实体设备时的一致验证画面</span>
+    </div>
+    <div class="composite-wrap">
+      <canvas id="compositeCanvas"></canvas>
+    </div>
+    <div class="stats" id="statsBox"></div>
+    <div class="panel-head sub"><h2>接缝亮度剖面 (重叠带)</h2></div>
+    <canvas id="seamCanvas" width="320" height="120"></canvas>
+    <div class="export-row">
+      <button id="exportCompositeBtn" class="btn small">导出合成 PNG</button>
+      <button id="exportReportBtn" class="btn small">导出报告 JSON</button>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <span id="statusText">就绪</span>
+  <span id="perfText"></span>
+</footer>
+
+<script src="src/vecmath.js"></script>
+<script src="src/scene.js"></script>
+<script src="src/projector.js"></script>
+<script src="src/content.js"></script>
+<script src="src/png.js"></script>
+<script src="src/render.js"></script>
+<script src="src/presets.js"></script>
+<script src="web/audio.js"></script>
+<script src="web/editor.js"></script>
+<script src="web/app.js"></script>
+</body>
+</html>
