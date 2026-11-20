@@ -136,6 +136,25 @@ select:focus, input:focus { outline: 1px solid var(--accent); }
 #seamCanvas { width: 100%; background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; }
 .export-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 
+.switch-row { margin: 6px 0 10px; }
+.switch-label { flex-direction: row !important; align-items: center; gap: 6px; color: var(--text) !important; }
+.switch-label input { margin: 0; }
+.mask-grid { grid-template-columns: 1fr 1fr; }
+
+.probe-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+.probe-box {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px; margin-bottom: 8px; max-height: 260px; overflow: auto;
+}
+.probe-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.probe-table th, .probe-table td { padding: 4px 6px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.probe-table th:first-child, .probe-table td:first-child { text-align: left; }
+.probe-table th { color: var(--muted); font-weight: 500; }
+.probe-table td.good { color: var(--good); }
+.probe-table td.bad { color: var(--bad); }
+.probe-final { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.probe-final .bad { color: var(--bad); }
+
 .statusbar {
   display: flex; justify-content: space-between;
   padding: 7px 18px; background: var(--panel); border-top: 1px solid var(--border);

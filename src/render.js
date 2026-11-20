@@ -62,7 +62,7 @@
         }
         const pr = P.projectPoint(view, hit.point);
         if (!pr.inView) { wall[i] = -1; continue; }
-        const wself = P.edgeWeight(view, pr.ndcX, pr.ndcY);
+        const wself = P.coverageWeight(view, pr.ndcX, pr.ndcY);
         if (wself <= 0) continue;
         weight[i] = wself;
         visible[i] = 1;
@@ -90,9 +90,16 @@
         continue;
       }
       const lin = C.sampleLinear(geo.cu[i], geo.v[i], pattern);
-      // 投影机实际显示图像 = 内容 * 通道增益 (颜色补偿); 融合份额在合成端按墙面点精确加权
+      // 投影机输出 = 内容 * 通道增益 (颜色补偿), 表示设备的可投影画面;
+      // 调光系数 dim 不在这里乘, 而是在合成端归一化之后作用一次, 否则会被叠加两次 (顺序错误)。
+      // 信号切断时该设备没有画面输出 (全黑), 与 "仍在投影但变暗" 的调暗情形严格区分。
       const r = lin[0] * rg, g = lin[1] * gg, b = lin[2] * bg;
       out.lin[o] = r; out.lin[o + 1] = g; out.lin[o + 2] = b; out.lin[o + 3] = 1;
+      if (pj.signal === false) {
+        out.lin[o] = 0; out.lin[o + 1] = 0; out.lin[o + 2] = 0;
+        out.rgba[o] = 0; out.rgba[o + 1] = 0; out.rgba[o + 2] = 0; out.rgba[o + 3] = 255;
+        continue;
+      }
       if (r > 1) out.clip[i * 3] = 1;
       if (g > 1) out.clip[i * 3 + 1] = 1;
       if (b > 1) out.clip[i * 3 + 2] = 1;
@@ -123,15 +130,30 @@
 
   /*
    * ---- 模拟相机重建 ----
-   * 每个相机像素: 射线打墙 -> 反投影到每台投影机 (遮挡剔除) -> 线性光空间直接叠加
-   * 投影机端已按 w_k/sum(w) 预补偿, 叠加即还原参考亮度, 接缝不会过亮
-   * blendGamma 仅改变羽化权重的显示曲线; 线性光与显示编码的处理空间始终分离
+   * 每个相机像素: 射线打墙 -> 反投影到每台投影机 (遮挡剔除) -> 线性光空间按份额合成
+   *
+   * 融合顺序 (顺序错误会直接表现为暗带或亮度翻倍):
+   *   1. 几何覆盖权重 w_k = 遮罩裁边 × 羽化带, 只描述墙面点是否被本机几何覆盖
+   *   2. 信号筛选: signal=false 的设备从贡献者集合剔除 (等同于设备不在场),
+   *      用剩余设备的 w_k 求分母 W=Σw_k 并归一化份额 w_k/W —— 有效权重重新分配
+   *   3. 归一化之后才在每路线性光上乘调光系数 dim: dim 只降低该路亮度,
+   *      它的份额与分母保持不变 (设备仍在投影、仍对墙面有响应), 暗机不触发重归一
+   *   4. blendGamma 仅改变份额曲线, 应用在归一化之前且之后重新归一, 不改变处理空间
    */
   function renderComposite(cam, camGeo, scene, projectors, pjGeos, pjOutputs, pattern, gamma, blendGamma) {
     blendGamma = blendGamma || 1;
     const out = makeRGBA(cam.width, cam.height);
     const n = cam.width * cam.height;
+    const K = projectors.length;
     const ref = new Float32Array(n * 3);
+    // 逐像素探针: 每机遮盖/几何权重、归一分母、份额、调光后最终贡献, 供锁定墙点逐机读出
+    const probeW = new Float32Array(n * K);
+    const probeMask = new Uint8Array(n * K);
+    const probeSignal = new Uint8Array(n * K);
+    const probeShare = new Float32Array(n * K);
+    const probeContrib = new Float32Array(n * K * 3);
+    const probeDen = new Float32Array(n);
+    const probeCount = new Uint8Array(n);
     const seamRows = new Float32Array(cam.height);
     const seamW = new Float32Array(cam.height);
     let wallPixels = 0, uncovered = 0, errSum = 0, errN = 0;
@@ -149,44 +171,50 @@
       ref[i * 3] = refLin[0]; ref[i * 3 + 1] = refLin[1]; ref[i * 3 + 2] = refLin[2];
 
       const acc = [0, 0, 0];
-      let contributors = 0;
       const hits = [];
       let wsum = 0;
-      for (let k = 0; k < projectors.length; k++) {
+      const worldPoint = S.worldFromUV(scene, camGeo.wall[i], camGeo.u[i], camGeo.v[i]);
+      for (let k = 0; k < K; k++) {
         const pj = projectors[k];
         const geo = pjGeos[k];
         // 反投影到投影机并校验其几何缓冲命中同一墙面 (遮挡/超范围剔除)
         const pjHit = projectPointOnWall(pj, scene, geo, camGeo, i);
         if (!pjHit) continue;
-        // 在墙面点处精确计算本机羽化权重 (而非取相邻投影机像素), 保证分母一致
-        const pr = P.projectPoint(pj, S.worldFromUV(scene, camGeo.wall[i], camGeo.u[i], camGeo.v[i]));
-        const wExact = P.edgeWeight(pj, pr.ndcX, pr.ndcY);
+        // 在墙面点处精确计算本机几何权重 (而非取相邻投影机像素), 保证分母一致
+        const pr = P.projectPoint(pj, worldPoint);
+        const mask = P.maskWeight(pj, pr.ndcX, pr.ndcY);
+        const wExact = mask === 0 ? 0 : P.edgeWeight(pj, pr.ndcX, pr.ndcY);
+        probeMask[i * K + k] = mask;
+        probeW[i * K + k] = wExact;
+        probeSignal[i * K + k] = pj.signal === false ? 0 : 1;
         if (wExact <= 0) continue;
+        // 信号切断: 设备不在场, 不进贡献者集合也不进分母 (其余各机有效权重重新分配)
+        if (pj.signal === false) continue;
         const s = sampleProjectorLinear(pjOutputs[k], pjHit.px, pjHit.py, pj.width, pj.height);
         // 该投影机像素中心射线实际命中的墙面点 (精确浮点), 与相机目标点的世界偏差用于标定残差
         const pjRay = P.rayForPixel(pj, pjHit.px, pjHit.py);
         const pjWallHit = S.raycastWall(scene, pjRay.origin, pjRay.dir);
         const sampledPoint = pjWallHit ? pjWallHit.point : null;
-        hits.push({ wExact, s, sampledPoint });
+        hits.push({ k, wExact, s, sampledPoint });
         wsum += wExact;
-        contributors++;
       }
+      probeDen[i] = wsum;
+      probeCount[i] = hits.length;
 
-      if (contributors === 0) {
+      if (hits.length === 0) {
         uncovered++;
         out.rgba[o + 3] = 0;
         continue;
       }
-      if (contributors > 1) {
+      if (hits.length > 1) {
         overlapPixels++;
         // 标定残差: 各机像素中心实际命中的世界点与相机目标点之差, 反投到相机像素口径
-        const targetPoint = S.worldFromUV(scene, camGeo.wall[i], camGeo.u[i], camGeo.v[i]);
         let regPx = 0;
         for (const h2 of hits) {
           if (!h2.sampledPoint) continue;
-          const diff = V.sub(h2.sampledPoint, targetPoint);
-          const off = V.add(targetPoint, diff);
-          const a = P.projectPoint(cam, targetPoint);
+          const diff = V.sub(h2.sampledPoint, worldPoint);
+          const off = V.add(worldPoint, diff);
+          const a = P.projectPoint(cam, worldPoint);
           const b = P.projectPoint(cam, off);
           const pa = P.ndcToPixel(cam, a.ndcX, a.ndcY);
           const pb = P.ndcToPixel(cam, b.ndcX, b.ndcY);
@@ -196,16 +224,22 @@
         regSum += regPx;
         regMax = Math.max(regMax, regPx);
       }
-      // 归一化加权在线性光空间完成: 份额 w_k/sum(w), 任何重叠点数机之和恒为 1, 接缝不会过亮
+      // 归一化加权在线性光空间完成: 份额 w_k/sum(w), 任何重叠点数机份额之和恒为 1
       // blendGamma 仅改变融合曲线 (对份额取指数后重新归一), 不改变线性/编码的处理空间
       const rawShares = hits.map((h) => Math.pow(h.wExact / wsum, blendGamma));
       const shareSum = rawShares.reduce((a, b2) => a + b2, 0);
       for (let k2 = 0; k2 < hits.length; k2++) {
         const share = rawShares[k2] / shareSum;
         const h = hits[k2];
-        acc[0] += h.s[0] * share;
-        acc[1] += h.s[1] * share;
-        acc[2] += h.s[2] * share;
+        const dim = projectors[h.k].dim;
+        // 调光在归一化之后作用: 分母/份额不变, 只有该路亮度按 dim 衰减 (设备响应保留)
+        probeShare[i * K + h.k] = share;
+        probeContrib[(i * K + h.k) * 3] = h.s[0] * share;
+        probeContrib[(i * K + h.k) * 3 + 1] = h.s[1] * share;
+        probeContrib[(i * K + h.k) * 3 + 2] = h.s[2] * share;
+        acc[0] += h.s[0] * share * dim;
+        acc[1] += h.s[1] * share * dim;
+        acc[2] += h.s[2] * share * dim;
       }
       const r = acc[0], g = acc[1], b = acc[2];
       out.lin[o] = r; out.lin[o + 1] = g; out.lin[o + 2] = b; out.lin[o + 3] = 1;
@@ -216,7 +250,7 @@
 
       const e = Math.hypot(r - refLin[0], g - refLin[1], b - refLin[2]) / Math.sqrt(3);
       errSum += e; errN++; maxErr = Math.max(maxErr, e);
-      if (contributors > 1) {
+      if (hits.length > 1) {
         seamErrSum += e;
         const py = Math.floor(i / cam.width);
         seamRows[py] += e; seamW[py] += 1;
@@ -225,6 +259,16 @@
 
     for (let y = 0; y < cam.height; y++) if (seamW[y] > 0) seamRows[y] /= seamW[y];
     out.reference = ref;
+    out.probe = {
+      K,
+      weight: probeW,
+      mask: probeMask,
+      signal: probeSignal,
+      share: probeShare,
+      contrib: probeContrib,
+      denominator: probeDen,
+      count: probeCount
+    };
     out.stats = {
       wallPixels,
       uncovered,
@@ -305,6 +349,76 @@
     return f < w || f > 1 - w;
   }
 
+  /* 锁定墙上一点 (相机像素索引), 逐机读出遮盖、几何权重、归一分母、份额、调光与最终亮度。
+     用于把 "调暗但保留设备响应" 与 "切断信号重新归一" 两种情形在同一点上区分开。 */
+  function probeAtPixel(composite, projectors, pixelIndex) {
+    const pr = composite.probe;
+    const K = pr.K;
+    const rows = [];
+    for (let k = 0; k < K; k++) {
+      const j = pixelIndex * K + k;
+      const co = j * 3;
+      rows.push({
+        projector: projectors[k].id,
+        name: projectors[k].name,
+        covered: pr.mask[j] === 1,
+        signalOn: pr.signal[j] === 1,
+        weight: pr.weight[j],
+        denominator: pr.denominator[pixelIndex],
+        share: pr.share[j],
+        dim: projectors[k].dim,
+        contribution: [pr.contrib[co], pr.contrib[co + 1], pr.contrib[co + 2]]
+      });
+    }
+    const o = pixelIndex * 4;
+    return {
+      pixelIndex,
+      contributors: pr.count[pixelIndex],
+      denominator: pr.denominator[pixelIndex],
+      final: [composite.lin[o], composite.lin[o + 1], composite.lin[o + 2]],
+      reference: [
+        composite.reference[pixelIndex * 3],
+        composite.reference[pixelIndex * 3 + 1],
+        composite.reference[pixelIndex * 3 + 2]
+      ],
+      projectors: rows
+    };
+  }
+
+  /* 两帧线性参考合成逐像素比较, 只统计两帧都被墙覆盖的像素; maxDiff 按 RGB 通道最大绝对差给出。
+     touchedOnly=true 时进一步限定为两帧有效贡献者集合发生变化的像素, 用来验证
+     "改动仅沿实际覆盖关系传播": 集合不变的单机覆盖墙区差值必须为 0。 */
+  function diffLinearFrames(a, b, touchedOnly) {
+    const n = a.lin.length / 4;
+    let count = 0, sum = 0, maxDiff = 0, changedMembership = 0;
+    let soleCoverageChanged = 0, soleCoverageTotal = 0;
+    for (let i = 0; i < n; i++) {
+      const o = i * 4;
+      if (a.rgba[o + 3] !== 255 || b.rgba[o + 3] !== 255) continue;
+      const membershipChanged = a.probe.count[i] !== b.probe.count[i];
+      if (membershipChanged) changedMembership++;
+      if (a.probe.count[i] === 1 && b.probe.count[i] === 1) {
+        soleCoverageTotal++;
+        if (membershipChanged) soleCoverageChanged++;
+      }
+      if (touchedOnly && !membershipChanged) continue;
+      let d = 0;
+      for (let c = 0; c < 3; c++) {
+        d = Math.max(d, Math.abs(a.lin[o + c] - b.lin[o + c]));
+      }
+      sum += d; count++;
+      maxDiff = Math.max(maxDiff, d);
+    }
+    return {
+      pixels: count,
+      meanDiff: count ? sum / count : 0,
+      maxDiff,
+      changedMembership,
+      soleCoverageTotal,
+      soleCoverageChanged
+    };
+  }
+
   function Renderer() {
     this.pjGeo = [];
     this.camGeo = null;
@@ -314,7 +428,8 @@
   function geoSignature(scene, views) {
     const parts = [JSON.stringify(scene.corners), scene.height];
     for (const v of views) {
-      parts.push(v.id, v.pos.join(','), v.target.join(','), v.fovY, v.width, v.height, JSON.stringify(v.feather));
+      parts.push(v.id, v.pos.join(','), v.target.join(','), v.fovY, v.width, v.height,
+        JSON.stringify(v.feather), JSON.stringify(v.maskCrop));
     }
     return parts.join('|');
   }
@@ -350,6 +465,8 @@
     renderComposite,
     buildCalibrationMesh,
     renderWarpedGrid,
-    makeRGBA
+    makeRGBA,
+    probeAtPixel,
+    diffLinearFrames
   };
 });

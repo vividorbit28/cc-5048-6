@@ -6,7 +6,7 @@
 })(typeof self !== 'undefined' ? self : this, function (V) {
   'use strict';
 
-  const PATTERNS = ['grid-gradient', 'grid', 'gradient', 'checker'];
+  const PATTERNS = ['grid-gradient', 'grid', 'gradient', 'checker', 'flat', 'steps'];
 
   function lin2enc(c, gamma) {
     return Math.pow(V.clamp(c, 0, 1), 1 / gamma);
@@ -24,7 +24,22 @@
     if (pattern === 'gradient') return gradient(cu, cv);
     if (pattern === 'grid') return grid(cu, cv, false);
     if (pattern === 'checker') return checker(cu, cv);
+    if (pattern === 'flat') return flatField(cu, cv);
+    if (pattern === 'steps') return steps(cu, cv);
     return grid(cu, cv, true);
+  }
+
+  /* 线性平场: 全墙恒定 0.5 线性光, 融合暗带/过亮在无内容干扰下直接显形 */
+  function flatField() {
+    return [0.5, 0.5, 0.5];
+  }
+
+  /* 自制阶梯灰: 11 级等间距线性灰阶沿内容横向排布, 阶与阶之间不做编码补偿 */
+  function steps(cu, cv) {
+    const n = 11;
+    const level = Math.min(n - 1, Math.floor(cu * n));
+    const g = level / (n - 1);
+    return [g, g, g];
   }
 
   function gradient(cu, cv) {

@@ -30,6 +30,12 @@
       gain: spec.gain == null ? 1 : spec.gain,
       rgb: (spec.rgb || [1, 1, 1]).slice(),
       feather: Object.assign({ left: 0.12, right: 0.12, bottom: 0.12, top: 0.12 }, spec.feather || {}),
+      // 带裁边的投影遮罩: 画面四边被硬裁掉的比例 (0..0.5), 裁掉区域遮盖 m=0, 属于几何性覆盖损失
+      maskCrop: Object.assign({ left: 0, right: 0, bottom: 0, top: 0 }, spec.maskCrop || {}),
+      // 调光系数 (线性光): 设备仍在投影, 只是变暗; 必须保留在融合分母里, 不触发权重重归一
+      dim: spec.dim == null ? 1 : spec.dim,
+      // 信号开关: false = 只切断信号, 该路完全不贡献并从分母剔除, 其余各机按有效权重重新归一
+      signal: spec.signal !== false,
       _basis: null
     };
     updateBasis(p);
@@ -87,6 +93,16 @@
     };
   }
 
+  /* 带裁边的投影遮罩: 落在硬裁边内的画面点被完全遮盖 (m=0), 其余为 1。
+     遮罩描述覆盖关系, 与描述融合渐变的羽化带相互独立, 二者相乘得到几何权重。 */
+  function maskWeight(p, ndcX, ndcY) {
+    const fx = (ndcX + 1) * 0.5; // 0..1
+    const fy = (ndcY + 1) * 0.5;
+    const m = p.maskCrop;
+    if (fx < m.left || fx > 1 - m.right || fy < m.bottom || fy > 1 - m.top) return 0;
+    return 1;
+  }
+
   /* 边缘羽化: 返回 0..1 线性权重, 羽化带宽度由 projector.feather 控制 */
   function edgeWeight(p, ndcX, ndcY) {
     const fx = (ndcX + 1) * 0.5; // 0..1
@@ -102,6 +118,13 @@
     return V.clamp(wx * wy, 0, 1);
   }
 
+  /* 几何覆盖权重: 遮罩裁边 × 羽化带。仅描述该点是否/以何份额被本机几何覆盖,
+     不含信号开关与调光——后两者属于有效贡献与亮度, 必须在归一化之后分别处理。 */
+  function coverageWeight(p, ndcX, ndcY) {
+    const m = maskWeight(p, ndcX, ndcY);
+    return m === 0 ? 0 : edgeWeight(p, ndcX, ndcY);
+  }
+
   /* 相机即无增益的投影机 */
   function createCamera(spec) {
     const c = createProjector(Object.assign({ gain: 1, rgb: [1, 1, 1], name: spec.name || 'CAM' }, spec));
@@ -109,5 +132,5 @@
     return c;
   }
 
-  return { createProjector, createCamera, updateBasis, setPose, rayForPixel, projectPoint, ndcToPixel, edgeWeight };
+  return { createProjector, createCamera, updateBasis, setPose, rayForPixel, projectPoint, ndcToPixel, edgeWeight, maskWeight, coverageWeight };
 });

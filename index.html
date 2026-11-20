@@ -90,6 +90,22 @@
         <label>G 增益<input type="number" id="pjG" min="0.1" max="2" step="0.05"></label>
         <label>B 增益<input type="number" id="pjB" min="0.1" max="2" step="0.05"></label>
       </div>
+      <div class="form-row">
+        <label>调光系数 dim (线性光, 设备仍投影; 不参与融合分母)
+          <input type="range" id="pjDim" min="0" max="1" step="0.05" value="1">
+          <span id="pjDimVal">1.00</span>
+        </label>
+      </div>
+      <div class="form-row switch-row">
+        <label class="switch-label"><input type="checkbox" id="pjSignal" checked> 信号接通 (取消勾选=只切断信号, 其余各机权重重归一)</label>
+      </div>
+      <div class="form-grid mask-grid">
+        <label>遮罩左裁边<input type="number" id="mLeft" min="0" max="0.5" step="0.01" value="0"></label>
+        <label>遮罩右裁边<input type="number" id="mRight" min="0" max="0.5" step="0.01" value="0"></label>
+        <label>遮罩下裁边<input type="number" id="mBottom" min="0" max="0.5" step="0.01" value="0"></label>
+        <label>遮罩上裁边<input type="number" id="mTop" min="0" max="0.5" step="0.01" value="0"></label>
+      </div>
+      <p class="note">调暗只改该路线性亮度、份额与分母不变; 切断信号把该路从分母剔除并重新归一; 遮罩裁边是几何遮盖, 改变实际覆盖关系。</p>
       <div class="clip-status" id="clipStatus"></div>
     </div>
 
@@ -122,6 +138,8 @@
           <option value="grid">纯格线</option>
           <option value="gradient">平滑渐变</option>
           <option value="checker">棋盘格</option>
+          <option value="flat">线性平场 (0.5 恒亮查暗带)</option>
+          <option value="steps">自制阶梯灰 (11 级线性灰阶)</option>
         </select>
       </label>
       <div class="form-grid">
@@ -164,6 +182,18 @@
     </div>
     <div class="composite-wrap">
       <canvas id="compositeCanvas"></canvas>
+    </div>
+    <div class="probe-bar">
+      <button id="probeLockBtn" class="btn small">锁定点击的墙点</button>
+      <button id="probeCornerBtn" class="btn small">定位墙角被遮点</button>
+      <button id="probeThreeBtn" class="btn small">定位邻近三路点</button>
+      <span id="probePos" class="hint">未锁定</span>
+    </div>
+    <div id="probeBox" class="probe-box hidden"></div>
+    <div class="probe-bar">
+      <button id="frameBaseBtn" class="btn small">存为线性参考帧</button>
+      <button id="frameDiffBtn" class="btn small">对当前帧做逐帧比较</button>
+      <span id="frameDiffOut" class="hint"></span>
     </div>
     <div class="stats" id="statsBox"></div>
     <div class="panel-head sub"><h2>接缝亮度剖面 (重叠带)</h2></div>

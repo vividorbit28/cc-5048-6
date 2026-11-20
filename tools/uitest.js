@@ -132,6 +132,109 @@ const fire = (el, type) => el.dispatchEvent(new window.Event(type, { bubbles: tr
   const png = M.encodePNG(4, 4, new Uint8ClampedArray(64).fill(200));
   check('浏览器侧 PNG 编码可用', png[0] === 137 && png[1] === 80);
 
+  // ---- 新功能: 调暗 / 切断信号 / 遮罩裁边 / 探针 / 帧比较 (在线性平场上验证) ----
+  $('presetSelect').value = 'folded'; fire($('presetSelect'), 'change'); await wait(250);
+  $('correctBtn').click(); await wait(250);
+  $('patternSelect').value = 'flat'; fire($('patternSelect'), 'change'); await wait(250);
+
+  // 找一个三路公共覆盖像素
+  const probe0 = App.result.composite.probe;
+  let lockIdx = -1;
+  for (let i = 0; i < probe0.count.length; i++) {
+    if (probe0.count[i] === 3) { lockIdx = i; break; }
+  }
+  check('平场场景存在三路覆盖点', lockIdx >= 0);
+  App.lockedPixel = lockIdx;
+  App.updateProbePanel();
+  check('探针面板已显示', !$('probeBox').classList.contains('hidden'));
+  const baseProbe = M.probeAtPixel(App.result.composite, App.pjs, lockIdx);
+  check('探针逐机给出遮盖/分母/份额', baseProbe.projectors.length === 3 &&
+    baseProbe.projectors.every((r) => r.covered && r.denominator > 0 && r.share >= 0));
+
+  // 调暗一路: 份额与分母不变, 最终亮度下降, 设备仍有非零输出
+  const shareBefore = baseProbe.projectors.map((r) => r.share);
+  const lumBefore = baseProbe.final[0];
+  $('pjSelect').value = '0'; fire($('pjSelect'), 'change');
+  $('pjDim').value = '0.4'; fire($('pjDim'), 'input'); await wait(250);
+  const dimProbe = M.probeAtPixel(App.result.composite, App.pjs, lockIdx);
+  check('调暗不改份额与分母', dimProbe.projectors.every((r, k) =>
+    Math.abs(r.share - shareBefore[k]) < 1e-9 &&
+    Math.abs(r.denominator - baseProbe.denominator) < 1e-9));
+  // 该点 pj0 份额可能较小, 用与份额成正比的期望衰减量做容差, 而不是固定绝对阈值
+  const expectedDrop = lumBefore * shareBefore[0] * 0.6;
+  check('调暗使最终亮度按份额下降',
+    Math.abs((lumBefore - dimProbe.final[0]) - expectedDrop) < 0.005,
+    'drop=' + (lumBefore - dimProbe.final[0]).toFixed(5) + ' expect~' + expectedDrop.toFixed(5));
+  check('调暗机仍输出非零线性光',
+    App.result.pjOutputs[0].lin.some((v, c) => c % 4 < 3 && v > 0));
+  check('调暗不改变覆盖成员数', App.result.composite.probe.count[lockIdx] === 3);
+
+  // 切断同一路信号: 该路份额 0, 其余重新归一到 1, 平场仍还原 0.5
+  $('pjSignal').checked = false; fire($('pjSignal'), 'change'); await wait(250);
+  const offProbe = M.probeAtPixel(App.result.composite, App.pjs, lockIdx);
+  check('切断信号机份额为 0', offProbe.projectors[0].share === 0 && offProbe.projectors[0].signalOn === false);
+  check('剩余机份额重新归一',
+    Math.abs(offProbe.projectors.slice(1).reduce((a, r) => a + r.share, 0) - 1) < 1e-6);
+  check('切断后平场仍无暗带', Math.abs(offProbe.final[0] - 0.5) < 1e-6);
+  check('切断信号机输出全黑',
+    App.result.pjOutputs[0].lin.every((v, c) => c % 4 === 3 || v === 0));
+  // 重新接通 -> 回到与调暗态一致 (成员恢复)
+  $('pjSignal').checked = true; fire($('pjSignal'), 'change'); await wait(250);
+  const reProbe = M.probeAtPixel(App.result.composite, App.pjs, lockIdx);
+  check('信号重新接通后成员恢复为 3', App.result.composite.probe.count[lockIdx] === 3 &&
+    Math.abs(reProbe.final[0] - dimProbe.final[0]) < 1e-9);
+  $('pjDim').value = '1'; fire($('pjDim'), 'input'); await wait(250);
+
+  // 遮罩裁边: 几何性遮盖, 把原本可达的墙点变成无覆盖 (uncovered 增加); 几何缓存应失效重算
+  const uncovBefore = App.result.composite.stats.uncovered;
+  $('mLeft').value = '0.3'; fire($('mLeft'), 'input'); await wait(250);
+  check('遮罩裁边产生新的无覆盖墙点',
+    App.result.composite.stats.uncovered > uncovBefore,
+    App.result.composite.stats.uncovered + ' vs ' + uncovBefore);
+  // 在被遮区域取点: 探针应能读到某机 covered=false / 权重 0
+  let maskedPixel = -1;
+  const pm = App.result.composite.probe;
+  const K = pm.K;
+  outer:
+  for (let i = 0; i < pm.count.length; i++) {
+    for (let k = 0; k < K; k++) {
+      if (pm.mask[i * K + k] === 0 && pm.signal[i * K + k] === 1) { maskedPixel = i; break outer; }
+    }
+  }
+  check('探针可读出被遮机 covered=false', maskedPixel >= 0 &&
+    M.probeAtPixel(App.result.composite, App.pjs, maskedPixel).projectors.some((r) => !r.covered));
+  $('mLeft').value = '0'; fire($('mLeft'), 'input'); await wait(250);
+
+  // 帧比较: 存基准 -> 调暗 ->  touchedOnly 帧差成员数为 0 (调暗不改覆盖), 但像素亮度有差
+  $('frameBaseBtn').click();
+  check('参考帧已存储', !!App.referenceFrame);
+  $('pjDim').value = '0.3'; fire($('pjDim'), 'input'); await wait(250);
+  $('frameDiffBtn').click(); await wait(50);
+  const dimDiffText = $('frameDiffOut').textContent;
+  check('调暗帧差: 成员变化为 0 且单机覆盖区不受影响',
+    /成员变化像素 0/.test(dimDiffText) && /单机覆盖区受影响 0\//.test(dimDiffText), dimDiffText);
+  // 切断信号: 成员变化 > 0, 单机覆盖区仍不受影响
+  $('pjDim').value = '1'; fire($('pjDim'), 'input'); await wait(250);
+  $('pjSignal').checked = false; fire($('pjSignal'), 'change'); await wait(250);
+  $('frameDiffBtn').click(); await wait(50);
+  const offDiffText = $('frameDiffOut').textContent;
+  check('切断帧差: 成员变化 > 0 且单机覆盖区不受影响',
+    /成员变化像素 [1-9]/.test(offDiffText) && /单机覆盖区受影响 0\//.test(offDiffText), offDiffText);
+  $('pjSignal').checked = true; fire($('pjSignal'), 'change'); await wait(250);
+
+  // 墙角被遮点 / 邻近三路点定位按钮
+  $('probeCornerBtn').click(); await wait(50);
+  const cornerIdx = App.lockedPixel;
+  check('墙角定位到 0 贡献被遮点', cornerIdx >= 0 && App.result.composite.probe.count[cornerIdx] === 0);
+  $('probeThreeBtn').click(); await wait(50);
+  check('邻近定位到三路贡献点', App.lockedPixel >= 0 &&
+    App.result.composite.probe.count[App.lockedPixel] === 3);
+
+  // 新图案可选且无异常
+  $('patternSelect').value = 'steps'; fire($('patternSelect'), 'change'); await wait(250);
+  check('阶梯灰图案可渲染', $('errorBanner').classList.contains('hidden'));
+  $('patternSelect').value = 'flat'; fire($('patternSelect'), 'change'); await wait(250);
+
   console.log('\n界面测试: ' + pass + ' 通过, ' + fail + ' 失败');
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('测试异常:', e); process.exit(1); });

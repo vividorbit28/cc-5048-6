@@ -15,7 +15,9 @@
     quality: 'standard',
     renderTimer: null,
     editor: null,
-    audio: new M.SpatialAudio()
+    audio: new M.SpatialAudio(),
+    lockedPixel: -1,
+    referenceFrame: null
   };
 
   /* ---------- 初始化与状态 ---------- */
@@ -25,12 +27,22 @@
       presetId: id,
       corners: preset.corners.map((c) => c.slice()),
       height: preset.height,
-      projectors: preset.projectors.map((p) => JSON.parse(JSON.stringify(p))),
+      projectors: preset.projectors.map((p) => {
+        const copy = JSON.parse(JSON.stringify(p));
+        // 控件直接读写 state, 这里补齐与 createProjector 一致的默认融合/遮罩/调光字段
+        copy.maskCrop = Object.assign({ left: 0, right: 0, bottom: 0, top: 0 }, copy.maskCrop || {});
+        if (copy.dim == null) copy.dim = 1;
+        if (copy.signal == null) copy.signal = true;
+        copy.feather = Object.assign({ left: 0.12, right: 0.12, bottom: 0.12, top: 0.12 }, copy.feather || {});
+        return copy;
+      }),
       camera: JSON.parse(JSON.stringify(preset.camera)),
       deviated: preset.deviated,
       correctPoses: preset.correctPoses ? JSON.parse(JSON.stringify(preset.correctPoses)) : null
     };
     App.selectedPJ = 0;
+    App.lockedPixel = -1;
+    App.referenceFrame = null;
     App.renderer.signature = '';
   }
 
@@ -77,6 +89,7 @@
     drawSeamChart();
     updateStats();
     updateClipStatus();
+    updateProbePanel();
     App.editor.draw(App.result);
     syncFormValues();
     $('perfText').textContent = '渲染耗时 ' + Math.round(performance.now() - t0) + ' ms';
@@ -115,6 +128,18 @@
     const cv = $('compositeCanvas');
     const out = App.result.composite;
     blit(cv, out.rgba, App.cam.width, App.cam.height);
+    if (App.lockedPixel >= 0) {
+      const ctx = cv.getContext('2d');
+      const x = App.lockedPixel % App.cam.width;
+      const y = Math.floor(App.lockedPixel / App.cam.width);
+      ctx.strokeStyle = '#ffd23f';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x - 5, y - 5, 10, 10);
+      ctx.beginPath();
+      ctx.moveTo(x - 8, y); ctx.lineTo(x + 8, y);
+      ctx.moveTo(x, y - 8); ctx.lineTo(x, y + 8);
+      ctx.stroke();
+    }
   }
 
   function drawWarpGrids() {
@@ -206,6 +231,11 @@
     $('pjTgtX').value = pj.target[0]; $('pjTgtY').value = pj.target[1]; $('pjTgtZ').value = pj.target[2];
     $('pjFov').value = pj.fovY; $('pjGain').value = pj.gain;
     $('pjR').value = pj.rgb[0]; $('pjG').value = pj.rgb[1]; $('pjB').value = pj.rgb[2];
+    $('pjDim').value = pj.dim; $('pjDimVal').textContent = Number(pj.dim).toFixed(2);
+    $('pjSignal').checked = pj.signal !== false;
+    const mc = pj.maskCrop;
+    $('mLeft').value = mc.left; $('mRight').value = mc.right;
+    $('mBottom').value = mc.bottom; $('mTop').value = mc.top;
     $('fLeft').value = pj.feather.left; $('fRight').value = pj.feather.right;
     $('fBottom').value = pj.feather.bottom; $('fTop').value = pj.feather.top;
     const cam = App.state.camera;
@@ -274,6 +304,19 @@
     bindNumber('pjG', (pj, v) => pj.rgb[1] = v);
     bindNumber('pjB', (pj, v) => pj.rgb[2] = v);
 
+    $('pjDim').addEventListener('input', (e) => {
+      const pj = App.state.projectors[App.selectedPJ];
+      pj.dim = Math.max(0, Math.min(1, parseFloat(e.target.value) || 0));
+      $('pjDimVal').textContent = pj.dim.toFixed(2);
+      scheduleRender();
+    });
+    $('pjSignal').addEventListener('change', (e) => {
+      App.state.projectors[App.selectedPJ].signal = e.target.checked;
+      scheduleRender();
+    });
+    bindMask('mLeft', 'left'); bindMask('mRight', 'right');
+    bindMask('mBottom', 'bottom'); bindMask('mTop', 'top');
+
     bindFeather('fLeft', 'left'); bindFeather('fRight', 'right');
     bindFeather('fBottom', 'bottom'); bindFeather('fTop', 'top');
 
@@ -310,6 +353,7 @@
     $('compositeCanvas').addEventListener('mousemove', onCompositeMove);
     $('compositeCanvas').addEventListener('mouseleave', () => App.audio.update(0.5, 0, false));
 
+    bindProbe();
     bindExports();
   }
 
@@ -328,6 +372,14 @@
       scheduleRender();
     });
   }
+  // 遮罩裁边只作用于当前选中机 (各机覆盖关系独立), 属几何量, 改动会使几何缓存失效
+  function bindMask(id, key) {
+    $(id).addEventListener('input', (e) => {
+      const v = Math.max(0, Math.min(0.5, parseFloat(e.target.value) || 0));
+      App.state.projectors[App.selectedPJ].maskCrop[key] = v;
+      scheduleRender();
+    });
+  }
   function num(id) { return parseFloat($(id).value) || 0; }
 
   function onCompositeMove(e) {
@@ -343,6 +395,99 @@
     const lin = App.result.composite.lin;
     const lum = inside ? (lin[i] * 0.2126 + lin[i + 1] * 0.7152 + lin[i + 2] * 0.0722) : 0;
     App.audio.update(nx, lum, inside);
+  }
+
+  function eventToPixel(e) {
+    const cv = $('compositeCanvas');
+    const r = cv.getBoundingClientRect();
+    const px = Math.floor(((e.clientX - r.left) / r.width) * App.cam.width);
+    const py = Math.floor(((e.clientY - r.top) / r.height) * App.cam.height);
+    return Math.max(0, Math.min(App.cam.width * App.cam.height - 1, py * App.cam.width + px));
+  }
+
+  /* 锁定墙上一点, 逐机读出遮盖、几何权重、归一分母、份额、调光与最终亮度 */
+  function updateProbePanel() {
+    const box = $('probeBox');
+    if (App.lockedPixel < 0 || !App.result) { box.classList.add('hidden'); return; }
+    const i = App.lockedPixel;
+    const probe = M.probeAtPixel(App.result.composite, App.pjs, i);
+    const py = Math.floor(i / App.cam.width), px = i % App.cam.width;
+    $('probePos').textContent = '锁定像素 (' + px + ',' + py + ') · 有效贡献机 ' +
+      probe.contributors + ' 台 · 归一分母 ' + probe.denominator.toFixed(4);
+    const lum = (v) => (v[0] * 0.2126 + v[1] * 0.7152 + v[2] * 0.0722).toFixed(4);
+    const rows = probe.projectors.map((r) =>
+      '<tr>' +
+      '<td>' + r.name + '</td>' +
+      '<td class="' + (r.covered ? 'good' : 'bad') + '">' + (r.covered ? '覆盖' : '被遮') + '</td>' +
+      '<td class="' + (r.signalOn ? 'good' : 'bad') + '">' + (r.signalOn ? '通' : '断') + '</td>' +
+      '<td>' + r.weight.toFixed(3) + '</td>' +
+      '<td>' + r.denominator.toFixed(3) + '</td>' +
+      '<td>' + r.share.toFixed(4) + '</td>' +
+      '<td>' + Number(r.dim).toFixed(2) + '</td>' +
+      '<td>' + lum(r.contribution) + '</td>' +
+      '</tr>').join('');
+    box.innerHTML =
+      '<table class="probe-table"><thead><tr>' +
+      '<th>投影机</th><th>遮盖</th><th>信号</th><th>几何权重</th><th>归一分母</th>' +
+      '<th>份额</th><th>调光</th><th>份额线性贡献(乘dim前)</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+      '<div class="probe-final">最终线性亮度 ' + probe.final.map((v) => v.toFixed(4)).join(', ') +
+      ' ｜ 线性参考 ' + probe.reference.map((v) => v.toFixed(4)).join(', ') +
+      (probe.contributors === 0 ? ' ｜ <span class="bad">该墙点无投影可达 (与混合误差分别定位)</span>' : '') +
+      '</div>';
+    box.classList.remove('hidden');
+  }
+
+  /* 在相机帧里找满足贡献机数量的墙点; nearPixel 给定时优先取其邻近像素 */
+  function findPixelByCount(want, nearPixel) {
+    const count = App.result.composite.probe.count;
+    const W = App.cam.width;
+    if (nearPixel >= 0) {
+      for (let d = 1; d <= 16; d++) {
+        for (const [dx, dy] of [[d, 0], [-d, 0], [0, d], [0, -d]]) {
+          const j = nearPixel + dy * W + dx;
+          if (j >= 0 && j < count.length && count[j] === want) return j;
+        }
+      }
+    }
+    for (let i = 0; i < count.length; i++) if (count[i] === want) return i;
+    return -1;
+  }
+
+  function bindProbe() {
+    $('compositeCanvas').addEventListener('click', (e) => {
+      App.lockedPixel = eventToPixel(e);
+      updateProbePanel();
+    });
+    $('probeLockBtn').addEventListener('click', () => {
+      if (App.lockedPixel < 0) App.lockedPixel = findPixelByCount(3);
+      updateProbePanel();
+    });
+    $('probeCornerBtn').addEventListener('click', () => {
+      // 墙角被遮住的采样点: 0 路有效贡献 (投影根本照不到)
+      App.lockedPixel = findPixelByCount(0, App.lockedPixel);
+      updateProbePanel();
+    });
+    $('probeThreeBtn').addEventListener('click', () => {
+      // 被遮点附近恰有三路贡献的对照点
+      App.lockedPixel = findPixelByCount(3, App.lockedPixel);
+      updateProbePanel();
+    });
+    $('frameBaseBtn').addEventListener('click', () => {
+      // 深拷贝线性帧, 避免后续渲染复用同一缓冲
+      const c = App.result.composite;
+      App.referenceFrame = {
+        lin: c.lin.slice(), rgba: c.rgba.slice(),
+        probe: { count: c.probe.count.slice() }
+      };
+      $('frameDiffOut').textContent = '已存参考帧 (线性光)';
+    });
+    $('frameDiffBtn').addEventListener('click', () => {
+      if (!App.referenceFrame) { $('frameDiffOut').textContent = '请先存参考帧'; return; }
+      const d = M.diffLinearFrames(App.referenceFrame, App.result.composite, true);
+      $('frameDiffOut').textContent =
+        '成员变化像素 ' + d.changedMembership + ' ｜ 帧差 max ' + d.maxDiff.toFixed(5) +
+        ' ｜ 单机覆盖区受影响 ' + d.soleCoverageChanged + '/' + d.soleCoverageTotal;
+    });
   }
 
   /* ---------- 导出 ---------- */
@@ -377,6 +522,7 @@
           id: pj.id, name: pj.name,
           pos: pj.pos, target: pj.target, fovY: pj.fovY,
           gain: pj.gain, rgb: pj.rgb, feather: pj.feather,
+          dim: pj.dim, signal: pj.signal !== false, maskCrop: pj.maskCrop,
           coverage: App.result.pjGeo[k].coverage,
           clippedPixels: countClip(App.result.pjOutputs[k])
         })),
@@ -427,5 +573,6 @@
 
   root.MPM.App = App;
   App.scheduleRender = scheduleRender;
+  App.updateProbePanel = updateProbePanel;
   window.addEventListener('DOMContentLoaded', App.boot);
 })(window);
